@@ -5,6 +5,7 @@
 #include <time.h>
 #include <string.h>
 #include <windows.h>
+#include "conv_ispc.h"
 // 如果希望重置模型训练进度，直接删去本目录下的 kernels, weights, biases 三个文件即可
 #define RED "\x1B[31m"
 #define RESET "\x1B[0m"
@@ -26,6 +27,7 @@
 #define LEARNING_RATE 0.01
 // 将训练集规模缩小为 600（可按需调整）
 #define TRAINING_SET_SIZE 600
+#define USE_ISPC 0 // 串行、并行的开关宏，其中：1 = 并行模式，0 = 串行模式
 
 // 增加卷积层计时统计变量
 double conv1_total_time = 0.0;
@@ -203,6 +205,8 @@ void save_kernels(cnn *network);
 void save_weights(cnn *network);
 void save_biases(cnn *network);
 
+int runtime_use_ispc = 0;
+
 int main(int argc, char **argv)
 {
     // 设置控制台编码
@@ -264,120 +268,124 @@ int main(int argc, char **argv)
     fflush(stdout);
     int n, i, j, m;
 
-    // 开始计时（训练总体耗时，单位秒）
-    clock_t train_start = clock();
-    // Training Loop
-    double batch_loss = 0;
-    double iteration_loss = 0;
-    for (m = 0; m < 200; m++)
+    // 我们将做两次训练：一次串行（runtime_use_ispc=0），一次并行（runtime_use_ispc=1）
+    int mode;
+    double serial_elapsed = 0.0, parallel_elapsed = 0.0;
+    double serial_conv1 = 0.0, serial_conv2 = 0.0, parallel_conv1 = 0.0, parallel_conv2 = 0.0;
+
+    for (mode = 0; mode < 2; mode++)
     {
-        image_ptr = fopen("train-images.idx3-ubyte", "rb");
-        label_ptr = fopen("train-labels.idx1-ubyte", "rb");
-        // 若打开失败，打印错误并退出，这能防止程序静默失败
-        if (!image_ptr)
-        {
-            fprintf(stderr, "Failed to open training images file 'train-images.idx3-ubyte'\n");
-            return EXIT_FAILURE;
-        }
-        if (!label_ptr)
-        {
-            fprintf(stderr, "Failed to open training labels file 'train-labels.idx1-ubyte'\n");
-            fclose(image_ptr);
-            return EXIT_FAILURE;
-        }
-        printf("Opened training files for iteration %d\n", m);
-        fflush(stdout);
-        read_headers(image_ptr, label_ptr);
-        // 每轮只处理 run_train_size 张图片（由命令行或宏控制）
-        int batches_per_iter = (run_train_size + BATCH_SIZE - 1) / BATCH_SIZE; // 向上取整
-        for (n = 0; n < batches_per_iter; n++)
-        {
-            int current_batch_size = BATCH_SIZE;
-            if (n == batches_per_iter - 1 && (run_train_size % BATCH_SIZE) != 0)
-            {
-                current_batch_size = run_train_size % BATCH_SIZE;
-            }
+        // 0 -> 串行，1 -> 并行
+        int use_ispc_runtime_mode = mode; // 临时标志，传递给运行时变量
+        // 将运行时开关赋给全局 runtime_use_ispc（在文件顶部新增 int runtime_use_ispc; 若尚未，添加）
+        runtime_use_ispc = use_ispc_runtime_mode;
 
-            zero_network(batch_gradient);
-            for (i = 0; i < current_batch_size; i++)
-            {
-                zero_network(image_gradient);
-                zero_activations(network);
-                load_image(network, image_ptr, label_ptr);
-                forward_propagate(network);
-                backpropagation(network, image_gradient);
-                update_batch_gradient(image_gradient, batch_gradient);
-                batch_loss += loss_function(network);
-            }
+        // 每次运行都从头开始，不加载上次训练参数，且不保存中间参数以免影响时间统计
+        int local_disable_load = 1;
+        int local_disable_save = 1;
 
-            gradient_descent(network, batch_gradient, current_batch_size);
-            printf("Loss for batch(%d, %d): %lf\n", m, n, batch_loss / (double)current_batch_size);
+        // 清零网络相关累加器和梯度
+        zero_network(batch_gradient);
+        zero_network(image_gradient);
+        zero_network(network);
+
+        // 清空卷积计时计数，开始本次计时
+        conv1_total_time = 0.0;
+        conv2_total_time = 0.0;
+        conv1_calls = 0;
+        conv2_calls = 0;
+
+        clock_t train_start_local = clock();
+
+        // 训练循环（与原逻辑一致）
+        double batch_loss_local = 0;
+        double iteration_loss_local = 0;
+        for (m = 0; m < 200; m++)
+        {
+            image_ptr = fopen("train-images.idx3-ubyte", "rb");
+            label_ptr = fopen("train-labels.idx1-ubyte", "rb");
+            if (!image_ptr)
+            {
+                fprintf(stderr, "Failed to open training images file 'train-images.idx3-ubyte'\n");
+                return EXIT_FAILURE;
+            }
+            if (!label_ptr)
+            {
+                fprintf(stderr, "Failed to open training labels file 'train-labels.idx1-ubyte'\n");
+                fclose(image_ptr);
+                return EXIT_FAILURE;
+            }
+            printf("Mode %s: Opened training files for iteration %d\n", runtime_use_ispc ? "PARALLEL" : "SERIAL", m);
             fflush(stdout);
-            iteration_loss += batch_loss;
-            batch_loss = 0;
+            read_headers(image_ptr, label_ptr);
 
-            if (!disable_save)
+            int batches_per_iter = (run_train_size + BATCH_SIZE - 1) / BATCH_SIZE;
+            for (n = 0; n < batches_per_iter; n++)
             {
-                save_parameters(network);
+                int current_batch_size = BATCH_SIZE;
+                if (n == batches_per_iter - 1 && (run_train_size % BATCH_SIZE) != 0)
+                    current_batch_size = run_train_size % BATCH_SIZE;
+
+                zero_network(batch_gradient);
+                for (i = 0; i < current_batch_size; i++)
+                {
+                    zero_network(image_gradient);
+                    zero_activations(network);
+                    load_image(network, image_ptr, label_ptr);
+                    forward_propagate(network);
+                    backpropagation(network, image_gradient);
+                    update_batch_gradient(image_gradient, batch_gradient);
+                    batch_loss_local += loss_function(network);
+                }
+
+                gradient_descent(network, batch_gradient, current_batch_size);
+                printf("Mode %s: Loss for batch(%d, %d): %lf\n", runtime_use_ispc ? "PAR" : "SER", m, n, batch_loss_local / (double)current_batch_size);
+                fflush(stdout);
+                iteration_loss_local += batch_loss_local;
+                batch_loss_local = 0;
+                // 不保存以免 IO 影响时间统计
             }
-        } // end batches loop
 
-        // 每个 epoch 的平均损失
-        printf("Loss for iteration(%d): %lf\n", m, iteration_loss / (double)run_train_size);
+            printf("Mode %s: Loss for iteration(%d): %lf\n", runtime_use_ispc ? "PARALLEL" : "SERIAL", m, iteration_loss_local / (double)run_train_size);
+            fflush(stdout);
+            iteration_loss_local = 0;
+            fclose(image_ptr);
+            fclose(label_ptr);
+        } // end epochs
+
+        clock_t train_end_local = clock();
+        double elapsed_local = (double)(train_end_local - train_start_local) / (double)CLOCKS_PER_SEC;
+
+        // 保存本次运行结果
+        if (mode == 0)
+        {
+            serial_elapsed = elapsed_local;
+            serial_conv1 = conv1_total_time;
+            serial_conv2 = conv2_total_time;
+        }
+        else
+        {
+            parallel_elapsed = elapsed_local;
+            parallel_conv1 = conv1_total_time;
+            parallel_conv2 = conv2_total_time;
+        }
+
+        printf("\nMode %s finished. Elapsed: %.3f s, conv1 total: %.6f s (%d calls), conv2 total: %.6f s (%d calls)\n\n",
+               runtime_use_ispc ? "PARALLEL" : "SERIAL",
+               elapsed_local,
+               conv1_total_time, conv1_calls,
+               conv2_total_time, conv2_calls);
         fflush(stdout);
-        iteration_loss = 0;
-        fclose(image_ptr);
-        fclose(label_ptr);
-    } // end epochs loop
+    } // end mode loop
 
-    // 训练结束，计算并打印耗时
-    // 训练结束，计算并打印详细耗时
-    clock_t train_end = clock();
-    double elapsed_seconds = (double)(train_end - train_start) / (double)CLOCKS_PER_SEC;
-
-    // 基础统计信息
-    printf("\n=== 卷积神经网络训练耗时统计 ===\n");
-    printf("总训练时间: %.3f 秒\n", elapsed_seconds);
-    printf("训练集规模: %d 张图片\n", run_train_size);
-    printf("训练轮数: 200\n");
-    printf("批处理大小: %d\n", BATCH_SIZE);
-
-    // 详细性能分析
-    int total_images_processed = run_train_size * 200;
-    int total_batches = 200 * ((run_train_size + BATCH_SIZE - 1) / BATCH_SIZE);
-    double avg_time_per_image = elapsed_seconds / total_images_processed;
-    double avg_time_per_epoch = elapsed_seconds / 200.0;
-    double avg_time_per_batch = elapsed_seconds / total_batches;
-
-    printf("\n=== 性能指标分析 ===\n");
-    printf("总处理图片数量: %d\n", total_images_processed);
-    printf("总批处理次数: %d\n", total_batches);
-    printf("单张图片平均处理时间: %.6f 秒\n", avg_time_per_image);
-    printf("单轮训练平均时间: %.3f 秒\n", avg_time_per_epoch);
-    printf("单批次平均处理时间: %.3f 秒\n", avg_time_per_batch);
-    printf("图片处理速度: %.2f 张/秒\n", total_images_processed / elapsed_seconds);
-
-    // 卷积层特定性能分析：计算平均时间（防止除0）
-    double conv1_avg_time = conv1_calls ? conv1_total_time / (double)conv1_calls : 0.0;
-    double conv2_avg_time = conv2_calls ? conv2_total_time / (double)conv2_calls : 0.0;
-
-    printf("\n=== 卷积层性能分析 ===\n");
-    printf("C1卷积层平均耗时: %.6f 秒\n", conv1_avg_time);
-    printf("C2卷积层平均耗时: %.6f 秒\n", conv2_avg_time);
-    printf("卷积层总耗时占比: %.2f%%\n", (conv1_total_time + conv2_total_time) / elapsed_seconds * 100);
-
-    // 实验环境信息（符合PDF要求）
-    // printf("\n=== 实验环境配置 ===\n");
-    // printf("处理器: [需填写具体CPU型号]\n");
-    // printf("内存容量: [需填写内存大小]\n");
-    // printf("编译器: gcc\n");
-    // printf("优化选项: -O2 -lm\n");
-
-    // 串行算法基准数据（为并行加速对比做准备）
-    printf("\n=== 串行算法基准数据 ===\n");
-    printf("串行处理总延时: %.3f 秒\n", elapsed_seconds);
-    printf("单张图片串行处理延时: %.6f 秒\n", avg_time_per_image);
-    printf("理论最大加速比分析: 待并行化后计算\n");
+    // 训练两次后，打印对比汇总（串行、并行）
+    printf("\n=== 两种模式耗时对比 ===\n");
+    printf("串行总训练时间: %.3f 秒\n", serial_elapsed);
+    printf("并行总训练时间: %.3f 秒\n", parallel_elapsed);
+    printf("串行 C1 总耗时: %.6f s, C2 总耗时: %.6f s\n", serial_conv1, serial_conv2);
+    printf("并行 C1 总耗时: %.6f s, C2 总耗时: %.6f s\n", parallel_conv1, parallel_conv2);
+    if (parallel_elapsed > 0.0)
+        printf("总体加速比 (串行/并行): %.3f\n", serial_elapsed / parallel_elapsed);
     fflush(stdout);
 
     // 防止双击运行时窗口马上关闭，等待回车
@@ -387,6 +395,27 @@ int main(int argc, char **argv)
 
     return (EXIT_SUCCESS);
 }
+
+//--------------------------主函数结束----------------------------------
+
+// 新增代码部分
+// 卷积输入一维化
+float *flatten_conv1_input(float conv1_input[600][1][6][6], int img_idx)
+{
+    return (float *)conv1_input[img_idx];
+}
+// 卷积核一维化
+float *flatten_conv1_kernel(float conv1_kernel[6][1][3][3])
+{
+    return (float *)conv1_kernel;
+}
+// 输出一维化
+float *flatten_conv1_output(float conv1_output[600][6][6][6], int img_idx)
+{
+    return (float *)conv1_output[img_idx];
+}
+
+//--------------------------结束--------------------------
 void save_parameters(cnn *network)
 {
     save_kernels(network);
@@ -784,40 +813,98 @@ void load_C1(cnn *network)
 {
     clock_t _t_start = clock(); // conv1 开始计时
 
-    // Create a list of the KERNEL_SIZExKERNEL_SIZE sections of the input image
+#if USE_ISPC == 1
+    // ISPC 并行分支
+    int in_w = INPUT_DIMENSIONS;
+    int in_h = INPUT_DIMENSIONS;
+    int in_ch = 1;                   // 单通道输入
+    int out_ch = C1_LENGTH;
+    int ksize = KERNEL_SIZE;
+    int out_w = C1_DIMENSIONS;
+    int out_h = C1_DIMENSIONS;
+
+    // 分配并填充 input (单张图，单通道)
+    float *input_f = (float *)malloc(sizeof(float) * in_w * in_h);
+    for (int y = 0; y < in_h; y++)
+        for (int x = 0; x < in_w; x++)
+            input_f[y * in_w + x] = (float)network->input_image->matrix[y][x];
+
+    // 分配并填充 kernels: layout [out_ch][ksize][ksize]
+    float *kernels_f = (float *)malloc(sizeof(float) * out_ch * ksize * ksize);
+    for (int oc = 0; oc < out_ch; oc++)
+    {
+        for (int j = 0; j < ksize; j++)
+        {
+            for (int k = 0; k < ksize; k++)
+            {
+                kernels_f[(oc * ksize + j) * ksize + k] = 
+                    (float)network->C1_Kernels->kernels[0][oc]->matrix[j][k];
+            }
+        }
+    }
+
+    // biases -> float
+    float *bias_f = (float *)malloc(sizeof(float) * out_ch);
+    for (int oc = 0; oc < out_ch; oc++)
+        bias_f[oc] = (float)network->C1_Biases->vector[oc];
+
+    // 输出缓冲
+    float *output_f = (float *)malloc(sizeof(float) * out_ch * out_w * out_h);
+
+    // 直接包含头文件中声明的函数
+    #include "conv_ispc.h"
+    // 调用 ISPC 函数，参数按 conv_ispc.h 的定义
+    ispc_conv1(
+        input_f, 
+        in_ch, in_w, in_h,
+        kernels_f, ksize, in_ch, out_ch,
+        bias_f,
+        output_f,
+        out_w, out_h
+    );
+
+    // 拷回 network->C1_Images 并应用激活
+    for (int oc = 0; oc < out_ch; oc++)
+        for (int y = 0; y < out_h; y++)
+            for (int x = 0; x < out_w; x++)
+            {
+                double v = (double)output_f[(oc * out_h + y) * out_w + x];
+                network->C1_Images->image[oc]->matrix[y][x] = activation(v);
+            }
+
+    free(input_f);
+    free(kernels_f);
+    free(bias_f);
+    free(output_f);
+
+#else
+    // 串行分支保持原样
     int length = C1_DIMENSIONS * C1_DIMENSIONS;
     image_vector *input_sections = new_image_vector(KERNEL_SIZE, length);
     int i, j, k;
     for (i = 0; i < length; i++)
-    {
         for (j = 0; j < KERNEL_SIZE; j++)
-        {
             for (k = 0; k < KERNEL_SIZE; k++)
-            {
                 input_sections->image[i]->matrix[j][k] =
                     network->input_image->matrix[(int)floor((double)i / C1_DIMENSIONS) + j][i % C1_DIMENSIONS + k];
-            }
-        }
-    }
+
     for (i = 0; i < C1_LENGTH; i++)
-    {
         for (j = 0; j < C1_DIMENSIONS; j++)
-        {
             for (k = 0; k < C1_DIMENSIONS; k++)
-            {
                 network->C1_Images->image[i]->matrix[j][k] = activation(
-                    dot_product(input_sections->image[(j * C1_DIMENSIONS) + k], network->C1_Kernels->kernels[0][i], KERNEL_SIZE) + network->C1_Biases->vector[i]);
-            }
-        }
-    }
+                    dot_product(input_sections->image[(j * C1_DIMENSIONS) + k], network->C1_Kernels->kernels[0][i], KERNEL_SIZE) +
+                    network->C1_Biases->vector[i]);
+
     free_image_vector(input_sections, KERNEL_SIZE, length);
     free(input_sections);
+#endif
 
-    // conv1 计时结束并累加
+    // 计时累加
     clock_t _t_end = clock();
     conv1_total_time += (double)(_t_end - _t_start) / (double)CLOCKS_PER_SEC;
     conv1_calls++;
 }
+
 
 void load_S1(cnn *network)
 {
@@ -860,55 +947,101 @@ void load_C2(cnn *network)
 {
     clock_t _t_start = clock(); // conv2 开始计时
 
+#if USE_ISPC == 1
+    // ISPC 并行分支
+    int in_w = C1_DIMENSIONS;
+    int in_h = C1_DIMENSIONS;
+    int in_ch = S1_LENGTH;      // S1 输出通道数
+    int out_ch = C2_LENGTH;
+    int ksize = KERNEL_SIZE;
+    int out_w = C2_DIMENSIONS;
+    int out_h = C2_DIMENSIONS;
+
+    // 分配并填充 input (多通道 S1)
+    float *input_f = (float *)malloc(sizeof(float) * in_ch * in_w * in_h);
+    for (int c = 0; c < in_ch; c++)
+        for (int y = 0; y < in_h; y++)
+            for (int x = 0; x < in_w; x++)
+                input_f[(c * in_h + y) * in_w + x] = (float)network->S1_Images->image[c]->matrix[y][x];
+
+    // 分配并填充 kernels: layout [out_ch][in_ch][ksize][ksize]
+    float *kernels_f = (float *)malloc(sizeof(float) * out_ch * in_ch * ksize * ksize);
+    for (int oc = 0; oc < out_ch; oc++)
+        for (int ic = 0; ic < in_ch; ic++)
+            for (int j = 0; j < ksize; j++)
+                for (int k = 0; k < ksize; k++)
+                    kernels_f[((oc * in_ch + ic) * ksize + j) * ksize + k] =
+                        (float)network->C2_Kernels->kernels[ic][oc]->matrix[j][k];
+
+    // biases -> float
+    float *bias_f = (float *)malloc(sizeof(float) * out_ch);
+    for (int oc = 0; oc < out_ch; oc++)
+        bias_f[oc] = (float)network->C2_Biases->vector[oc];
+
+    // 输出缓冲
+    float *output_f = (float *)malloc(sizeof(float) * out_ch * out_w * out_h);
+
+    // 包含 ISPC 头文件
+    #include "conv_ispc.h"
+    // 调用 ISPC 函数
+    ispc_conv1(
+        input_f,
+        in_ch, in_w, in_h,
+        kernels_f, ksize, in_ch, out_ch,
+        bias_f,
+        output_f,
+        out_w, out_h
+    );
+
+    // 拷回 network->C2_Images 并应用激活
+    for (int oc = 0; oc < out_ch; oc++)
+        for (int y = 0; y < out_h; y++)
+            for (int x = 0; x < out_w; x++)
+            {
+                double v = (double)output_f[(oc * out_h + y) * out_w + x];
+                network->C2_Images->image[oc]->matrix[y][x] = activation(v);
+            }
+
+    free(input_f);
+    free(kernels_f);
+    free(bias_f);
+    free(output_f);
+
+#else
+    // 串行分支保持原样
     image_vector *S1_sections[S1_LENGTH];
     int l, m, n, i, j, k;
     int length = C2_DIMENSIONS * C2_DIMENSIONS;
     for (i = 0; i < S1_LENGTH; i++)
-    {
         S1_sections[i] = new_image_vector(KERNEL_SIZE, length);
-    }
+
     for (n = 0; n < S1_LENGTH; n++)
-    {
         for (i = 0; i < length; i++)
-        {
             for (j = 0; j < KERNEL_SIZE; j++)
-            {
                 for (k = 0; k < KERNEL_SIZE; k++)
-                {
                     S1_sections[n]->image[i]->matrix[j][k] =
                         network->S1_Images->image[n]->matrix[(int)floor((double)i / C2_DIMENSIONS) + j][i % C1_DIMENSIONS + k];
-                }
-            }
-        }
-    }
 
     for (m = 0; m < C2_LENGTH; m++)
-    {
         for (n = 0; n < C2_DIMENSIONS; n++)
-        {
             for (i = 0; i < C2_DIMENSIONS; i++)
-            {
                 for (l = 0; l < S1_LENGTH; l++)
-                {
                     network->C2_Images->image[m]->matrix[n][i] +=
                         dot_product(S1_sections[l]->image[(n * C2_DIMENSIONS) + i], network->C2_Kernels->kernels[l][m], KERNEL_SIZE);
-                }
-            }
-        }
-    }
 
     for (i = 0; i < S1_LENGTH; i++)
     {
         free_image_vector(S1_sections[i], KERNEL_SIZE, length);
         free(S1_sections[i]);
     }
-    // 不要 free(*S1_sections) 因为 S1_sections 是栈数组
+#endif
 
     // conv2 计时结束并累加
     clock_t _t_end = clock();
     conv2_total_time += (double)(_t_end - _t_start) / (double)CLOCKS_PER_SEC;
     conv2_calls++;
 }
+
 
 void load_S2(cnn *network)
 {
