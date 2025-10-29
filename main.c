@@ -4,6 +4,7 @@
 #include <math.h>
 #include <time.h>
 #include <string.h>
+#include <windows.h>
 // 如果希望重置模型训练进度，直接删去本目录下的 kernels, weights, biases 三个文件即可
 #define RED "\x1B[31m"
 #define RESET "\x1B[0m"
@@ -25,6 +26,12 @@
 #define LEARNING_RATE 0.01
 // 将训练集规模缩小为 600（可按需调整）
 #define TRAINING_SET_SIZE 600
+
+// 增加卷积层计时统计变量
+double conv1_total_time = 0.0;
+double conv2_total_time = 0.0;
+int conv1_calls = 0;
+int conv2_calls = 0;
 
 struct VECTOR
 {
@@ -198,6 +205,8 @@ void save_biases(cnn *network);
 
 int main(int argc, char **argv)
 {
+    // 设置控制台编码
+    SetConsoleOutputCP(65001);
     FILE *image_ptr;
     FILE *label_ptr;
     srand(time(NULL));
@@ -322,12 +331,57 @@ int main(int argc, char **argv)
     } // end epochs loop
 
     // 训练结束，计算并打印耗时
+    // 训练结束，计算并打印详细耗时
     clock_t train_end = clock();
     double elapsed_seconds = (double)(train_end - train_start) / (double)CLOCKS_PER_SEC;
-    printf("Total training time: %.3f seconds\n", elapsed_seconds);
+
+    // 基础统计信息
+    printf("\n=== 卷积神经网络训练耗时统计 ===\n");
+    printf("总训练时间: %.3f 秒\n", elapsed_seconds);
+    printf("训练集规模: %d 张图片\n", run_train_size);
+    printf("训练轮数: 200\n");
+    printf("批处理大小: %d\n", BATCH_SIZE);
+
+    // 详细性能分析
+    int total_images_processed = run_train_size * 200;
+    int total_batches = 200 * ((run_train_size + BATCH_SIZE - 1) / BATCH_SIZE);
+    double avg_time_per_image = elapsed_seconds / total_images_processed;
+    double avg_time_per_epoch = elapsed_seconds / 200.0;
+    double avg_time_per_batch = elapsed_seconds / total_batches;
+
+    printf("\n=== 性能指标分析 ===\n");
+    printf("总处理图片数量: %d\n", total_images_processed);
+    printf("总批处理次数: %d\n", total_batches);
+    printf("单张图片平均处理时间: %.6f 秒\n", avg_time_per_image);
+    printf("单轮训练平均时间: %.3f 秒\n", avg_time_per_epoch);
+    printf("单批次平均处理时间: %.3f 秒\n", avg_time_per_batch);
+    printf("图片处理速度: %.2f 张/秒\n", total_images_processed / elapsed_seconds);
+
+    // 卷积层特定性能分析：计算平均时间（防止除0）
+    double conv1_avg_time = conv1_calls ? conv1_total_time / (double)conv1_calls : 0.0;
+    double conv2_avg_time = conv2_calls ? conv2_total_time / (double)conv2_calls : 0.0;
+
+    printf("\n=== 卷积层性能分析 ===\n");
+    printf("C1卷积层平均耗时: %.6f 秒\n", conv1_avg_time);
+    printf("C2卷积层平均耗时: %.6f 秒\n", conv2_avg_time);
+    printf("卷积层总耗时占比: %.2f%%\n", (conv1_total_time + conv2_total_time) / elapsed_seconds * 100);
+
+    // 实验环境信息（符合PDF要求）
+    // printf("\n=== 实验环境配置 ===\n");
+    // printf("处理器: [需填写具体CPU型号]\n");
+    // printf("内存容量: [需填写内存大小]\n");
+    // printf("编译器: gcc\n");
+    // printf("优化选项: -O2 -lm\n");
+
+    // 串行算法基准数据（为并行加速对比做准备）
+    printf("\n=== 串行算法基准数据 ===\n");
+    printf("串行处理总延时: %.3f 秒\n", elapsed_seconds);
+    printf("单张图片串行处理延时: %.6f 秒\n", avg_time_per_image);
+    printf("理论最大加速比分析: 待并行化后计算\n");
     fflush(stdout);
+
     // 防止双击运行时窗口马上关闭，等待回车
-    printf("Press Enter to exit...\n");
+    printf("\n按回车键退出程序...\n");
     fflush(stdout);
     getchar();
 
@@ -728,7 +782,8 @@ void load_image(cnn *network, FILE *image_ptr, FILE *label_ptr)
 // Propagate from input to C1
 void load_C1(cnn *network)
 {
-    // print_image(network->input_image, 28);
+    clock_t _t_start = clock(); // conv1 开始计时
+
     // Create a list of the KERNEL_SIZExKERNEL_SIZE sections of the input image
     int length = C1_DIMENSIONS * C1_DIMENSIONS;
     image_vector *input_sections = new_image_vector(KERNEL_SIZE, length);
@@ -743,7 +798,6 @@ void load_C1(cnn *network)
                     network->input_image->matrix[(int)floor((double)i / C1_DIMENSIONS) + j][i % C1_DIMENSIONS + k];
             }
         }
-        // print_image(input_sections->image[i], 5);
     }
     for (i = 0; i < C1_LENGTH; i++)
     {
@@ -755,10 +809,14 @@ void load_C1(cnn *network)
                     dot_product(input_sections->image[(j * C1_DIMENSIONS) + k], network->C1_Kernels->kernels[0][i], KERNEL_SIZE) + network->C1_Biases->vector[i]);
             }
         }
-        // print_image(network->C1_Images->image[i], 24);
     }
     free_image_vector(input_sections, KERNEL_SIZE, length);
     free(input_sections);
+
+    // conv1 计时结束并累加
+    clock_t _t_end = clock();
+    conv1_total_time += (double)(_t_end - _t_start) / (double)CLOCKS_PER_SEC;
+    conv1_calls++;
 }
 
 void load_S1(cnn *network)
@@ -800,6 +858,8 @@ void load_S1(cnn *network)
 
 void load_C2(cnn *network)
 {
+    clock_t _t_start = clock(); // conv2 开始计时
+
     image_vector *S1_sections[S1_LENGTH];
     int l, m, n, i, j, k;
     int length = C2_DIMENSIONS * C2_DIMENSIONS;
@@ -807,7 +867,6 @@ void load_C2(cnn *network)
     {
         S1_sections[i] = new_image_vector(KERNEL_SIZE, length);
     }
-    // print_image(network->S1_Images->image[0], 12);
     for (n = 0; n < S1_LENGTH; n++)
     {
         for (i = 0; i < length; i++)
@@ -817,11 +876,9 @@ void load_C2(cnn *network)
                 for (k = 0; k < KERNEL_SIZE; k++)
                 {
                     S1_sections[n]->image[i]->matrix[j][k] =
-                        network->S1_Images->image[n]->matrix[(int)floor((double)i / C2_DIMENSIONS) + j][i % C2_DIMENSIONS + k];
+                        network->S1_Images->image[n]->matrix[(int)floor((double)i / C2_DIMENSIONS) + j][i % C1_DIMENSIONS + k];
                 }
             }
-            // if(n < 2)
-            // print_image(S1_sections[n]->image[i], 5);
         }
     }
 
@@ -843,8 +900,14 @@ void load_C2(cnn *network)
     for (i = 0; i < S1_LENGTH; i++)
     {
         free_image_vector(S1_sections[i], KERNEL_SIZE, length);
+        free(S1_sections[i]);
     }
-    free(*S1_sections);
+    // 不要 free(*S1_sections) 因为 S1_sections 是栈数组
+
+    // conv2 计时结束并累加
+    clock_t _t_end = clock();
+    conv2_total_time += (double)(_t_end - _t_start) / (double)CLOCKS_PER_SEC;
+    conv2_calls++;
 }
 
 void load_S2(cnn *network)
@@ -1146,37 +1209,46 @@ void update_batch_gradient(cnn *image_gradient, cnn *batch_gradient)
     }
 }
 
-void gradient_descent(cnn* network, cnn* gradient, int actual_batch_size){
+void gradient_descent(cnn *network, cnn *gradient, int actual_batch_size)
+{
     int n, m, j, k;
-    for(n = 0; n < C1_LENGTH; n++){
-        for(j = 0; j < KERNEL_SIZE; j++){
-            for(k = 0; k < KERNEL_SIZE; k++){
+    for (n = 0; n < C1_LENGTH; n++)
+    {
+        for (j = 0; j < KERNEL_SIZE; j++)
+        {
+            for (k = 0; k < KERNEL_SIZE; k++)
+            {
                 network->C1_Kernels->kernels[0][n]->matrix[j][k] -=
-                        LEARNING_RATE*(gradient->C1_Kernels->kernels[0][n]->matrix[j][k]/actual_batch_size);
+                    LEARNING_RATE * (gradient->C1_Kernels->kernels[0][n]->matrix[j][k] / actual_batch_size);
             }
         }
-        network->C1_Biases->vector[n] -= LEARNING_RATE*(gradient->C1_Biases->vector[n]/actual_batch_size);
+        network->C1_Biases->vector[n] -= LEARNING_RATE * (gradient->C1_Biases->vector[n] / actual_batch_size);
     }
-    for(n = 0; n < S1_LENGTH; n++){
-        for(m = 0; m < C2_LENGTH; m++){
-            for(j = 0; j < KERNEL_SIZE; j++){
-                for(k = 0; k < KERNEL_SIZE; k++){
+    for (n = 0; n < S1_LENGTH; n++)
+    {
+        for (m = 0; m < C2_LENGTH; m++)
+        {
+            for (j = 0; j < KERNEL_SIZE; j++)
+            {
+                for (k = 0; k < KERNEL_SIZE; k++)
+                {
                     network->C2_Kernels->kernels[n][m]->matrix[j][k] -=
-                            LEARNING_RATE*(gradient->C2_Kernels->kernels[n][m]->matrix[j][k]/actual_batch_size);
+                        LEARNING_RATE * (gradient->C2_Kernels->kernels[n][m]->matrix[j][k] / actual_batch_size);
                 }
             }
             network->C2_Biases->vector[m] -=
-                    LEARNING_RATE*(gradient->C2_Biases->vector[m]/actual_batch_size);
+                LEARNING_RATE * (gradient->C2_Biases->vector[m] / actual_batch_size);
         }
     }
-    for(n = 0; n < OUTPUT_LENGTH; n++){
-        for(m = 0; m < S2_LENGTH * S2_DIMENSIONS * S2_DIMENSIONS; m++){
+    for (n = 0; n < OUTPUT_LENGTH; n++)
+    {
+        for (m = 0; m < S2_LENGTH * S2_DIMENSIONS * S2_DIMENSIONS; m++)
+        {
             network->output_weights->matrix[n][m] -=
-                    LEARNING_RATE*(gradient->output_weights->matrix[n][m]/actual_batch_size);
-            
+                LEARNING_RATE * (gradient->output_weights->matrix[n][m] / actual_batch_size);
         }
         network->output_biases->vector[n] -=
-                LEARNING_RATE*(gradient->output_biases->vector[n]/actual_batch_size);
+            LEARNING_RATE * (gradient->output_biases->vector[n] / actual_batch_size);
     }
 }
 
